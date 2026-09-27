@@ -1,0 +1,230 @@
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from .cas_module import *
+
+Align_Corners_Range = False
+
+class RunningMeanLayer(nn.Module):
+    def __init__(self, feat_shape=(1,), momentum=0.1, eps=1e-5):
+        super().__init__()
+        self.feat_shape = feat_shape
+        self.momentum = momentum
+        self.eps = eps
+        
+        self.register_buffer('running_mean', torch.zeros(feat_shape))
+    
+    def forward(self, x, n_samples=1):
+        batch_mean = x.mean(dim=0)
+        with torch.no_grad():
+            self.running_mean = (1 - self.momentum) * self.running_mean + \
+                                self.momentum * batch_mean
+        
+        return self.running_mean
+
+class DepthNet(nn.Module):
+    def __init__(self, num_stage, use_dot_similarity, return_volume=False, return_photometric_confidence=False):
+        super(DepthNet, self).__init__()
+        self.num_stage = num_stage
+        self.use_dot_similarity = use_dot_similarity
+        self.return_volume = return_volume
+        self.return_photometric_confidence = return_photometric_confidence
+        
+        self.stat_mean_layers = nn.ModuleList(
+            [RunningMeanLayer(feat_shape=(1,)) for _ in range(num_stage)]
+        )
+
+    def forward(self, stage_idx, features, proj_matrices, depth_values, num_depth, cost_regularization, prob_volume_init=None):
+        assert len(features) == len(proj_matrices), "Different number of images and projection matrices"
+        assert depth_values.shape[1] == num_depth, "depth_values.shape[1]:{}  num_depth:{}".format(depth_values.shapep[1], num_depth)
+        num_views = len(features)
+
+        # step 1. feature extraction
+        # in: images; out: 32-channel feature maps
+        ref_feature, src_features = features[0], features[1:]
+        ref_proj, src_projs = proj_matrices[0], proj_matrices[1:]
+
+        # step 2. differentiable homograph, build cost volume
+        b, c, h, w = ref_feature.shape
+        ref_volume = ref_feature.unsqueeze(2).repeat(1, 1, num_depth, 1, 1)
+        if self.use_dot_similarity:
+            prob_volume_pre = torch.zeros(b, num_depth, h, w, device=ref_feature.device)
+        else:
+            volume_sum = torch.zeros(b, c, num_depth, h, w, device=ref_feature.device)
+        for src_fea, src_proj in zip(src_features, src_projs):
+            #warpped features
+            src_proj_new = src_proj[:, 0].clone()
+            src_proj_new[:, :3, :4] = torch.matmul(src_proj[:, 1, :3, :3], src_proj[:, 0, :3, :4])
+            ref_proj_new = ref_proj[:, 0].clone()
+            ref_proj_new[:, :3, :4] = torch.matmul(ref_proj[:, 1, :3, :3], ref_proj[:, 0, :3, :4])
+            warped_volume = homo_warping(src_fea, src_proj_new, ref_proj_new, depth_values)
+            # warped_volume = homo_warping(src_fea, src_proj[:, 2], ref_proj[:, 2], depth_values)
+            if self.use_dot_similarity:
+                similarity = (ref_volume * warped_volume).sum(dim=1) / (c ** 0.5) # like cross-attention
+                prob_volume_pre = prob_volume_pre + similarity
+                del similarity
+            else:   
+                volume_sum = volume_sum + torch.log(1 + (warped_volume - ref_volume) ** 2)
+
+            del warped_volume
+        if not self.use_dot_similarity:
+            # aggregate multiple feature volumes
+            num_src_views = num_views - 1
+            volume_mean = volume_sum / num_src_views
+            stat_mean = self.stat_mean_layers[stage_idx](volume_mean.view(-1, 1), n_samples=num_src_views) # (1)
+            volume_norm = stat_mean + (num_src_views ** 0.5) * (volume_mean - stat_mean)
+
+            # step 3. cost volume regularization
+            cost_reg = cost_regularization(volume_norm, stage_idx)
+            # cost_reg = F.upsample(cost_reg, [num_depth * 4, img_height, img_width], mode='trilinear')
+            prob_volume_pre = cost_reg.squeeze(1)
+
+        if prob_volume_init is not None:
+            prob_volume_pre += prob_volume_init
+
+        prob_volume = F.softmax(prob_volume_pre, dim=1)
+        depth = depth_regression(prob_volume, depth_values=depth_values)
+        
+        pdf_max = prob_volume.max(dim=1)[0] # B, H, W
+        
+        result = {}
+        result["depth"] = depth
+        result["pdf_max"] = pdf_max
+        
+        if not self.use_dot_similarity and self.return_volume:
+            # TODO: remove the inplace operation if needed (referenced by multiple tensors)
+            # volume_context = volume_sum.div_(num_views)
+            # feature_volume = torch.cat((volume_variance, volume_context), dim=1)
+            result["volume"] = None
+        
+        if not self.return_photometric_confidence:
+            return result
+
+        with torch.no_grad():
+            # photometric confidence
+            prob_volume_sum4 = 4 * F.avg_pool3d(F.pad(prob_volume.unsqueeze(1), pad=(0, 0, 0, 0, 1, 2)), (4, 1, 1), stride=1, padding=0).squeeze(1)
+            depth_index = depth_regression(prob_volume, depth_values=torch.arange(num_depth, device=prob_volume.device, dtype=torch.float)).long()
+            depth_index = depth_index.clamp(min=0, max=num_depth-1)
+            photometric_confidence = torch.gather(prob_volume_sum4, 1, depth_index.unsqueeze(1)).squeeze(1)
+
+        result["photometric_confidence"] = photometric_confidence
+        return result
+
+
+class CascadeMVSNet(nn.Module):
+    def __init__(self, use_dot_similarity=False, refine=False, ndepths=[48, 32, 8], depth_interals_ratio=[4, 2, 1], share_cr=False, source_view_num=2,
+                 grad_method="detach", in_channels=[64, 48, 32], arch_mode="fpn", cr_base_chs=[8, 8, 8], return_volume=False, return_photometric_confidence=False):
+        super(CascadeMVSNet, self).__init__()
+        self.use_dot_similarity = use_dot_similarity
+        self.refine = refine
+        self.share_cr = share_cr
+        self.ndepths = ndepths
+        self.depth_interals_ratio = depth_interals_ratio
+        self.grad_method = grad_method
+        self.base_channel = in_channels[len(in_channels) - 1]
+        self.in_channels = in_channels
+        self.arch_mode = arch_mode
+        self.cr_base_chs = cr_base_chs
+        self.num_stage = len(ndepths)
+        self.source_view_num = source_view_num
+
+
+        self.feature = FeatureNet(base_channels=self.base_channel, stride=4, num_stage=self.num_stage, arch_mode=self.arch_mode)
+        if self.share_cr:
+            self.cost_regularization = CostRegNet(in_channels=self.feature.out_channels, base_channels=8)
+        else:
+            self.cost_regularization = nn.ModuleList([CostRegNet(in_channels=self.in_channels,
+                                                                 base_channels=self.cr_base_chs[i])
+                                                      for i in range(self.num_stage)])
+        if self.refine:
+            self.refine_network = RefineNet()
+        self.DepthNet = DepthNet(num_stage=self.num_stage, use_dot_similarity=use_dot_similarity, return_volume=return_volume, return_photometric_confidence=return_photometric_confidence)
+
+    def backbone(self, ref_img: torch.Tensor, features: dict, proj_matrices, depth_values, imgs_shape: tuple):
+        outputs = {}
+        depth, cur_depth = None, None
+        cur_period = 1
+        depth_range = (depth_values[:, 0], depth_values[:, -1]) # ((B), (B))
+        b, v, c, h, w = imgs_shape
+        
+        assert v >= self.source_view_num + 1, "Input view number {} is smaller than required {}".format(v, self.source_view_num + 1)
+        # DEPRECATED: select source views, note that proj_matrices and features have been shifted (0 is target view)
+        if v > self.source_view_num + 1:
+            positions = proj_matrices["stage1"][:, :, 0, :3, 3] # (B, V, 3)
+            src_relative_pos = positions - positions[:, :1] # (B, V, 3)
+            nearest_k_indices = torch.topk(torch.norm(src_relative_pos, dim=-1, p=2), self.source_view_num + 1, dim=-1, largest=False).indices # (B, source_view_num + 1)
+            
+        for stage_idx in range(self.num_stage):
+            # print("*********************stage{}*********************".format(stage_idx + 1))
+            #stage feature, proj_mats, scales
+            
+            features_stage = features["stage{}".format(stage_idx + 1)]
+            proj_matrices_stage = proj_matrices["stage{}".format(stage_idx + 1)]
+            
+            # if v > self.source_view_num + 1:
+            #     features_stage = features_stage.gather(1, nearest_k_indices.view(b, self.source_view_num + 1, 1, 1, 1).expand_as(features_stage[:, :self.source_view_num + 1, ...]))
+            #     proj_matrices_stage = proj_matrices_stage.gather(1, nearest_k_indices.view(b, self.source_view_num + 1, 1, 1, 1).expand_as(proj_matrices_stage[:, :self.source_view_num + 1, ...]))
+                
+            
+            features_stage = torch.unbind(features_stage, dim=1)  # tuple of (B, C, H, W)
+            proj_matrices_stage = torch.unbind(proj_matrices_stage, dim=1)
+            
+            stage_scale = 2.0 ** (self.num_stage - 1 - stage_idx)
+
+            if depth is not None:
+                if self.grad_method == "detach":
+                    cur_depth = depth.detach()
+                else:
+                    cur_depth = depth
+                cur_depth = F.interpolate(cur_depth.unsqueeze(1),
+                                                [h//int(stage_scale), w//int(stage_scale)], mode='bilinear',
+                                                align_corners=Align_Corners_Range).squeeze(1)
+            else:
+                cur_depth = depth_values
+            depth_range_samples, cur_period, near_far = get_depth_range_samples(cur_depth=cur_depth,
+                                                        period=cur_period, 
+                                                        ndepth=self.ndepths[stage_idx],
+                                                        depth_range=depth_range, 
+                                                        device=depth_values.device,
+                                                        shape=[b, h//int(stage_scale), w//int(stage_scale)])
+
+            outputs_stage = self.DepthNet(stage_idx, features_stage, proj_matrices_stage,
+                                          depth_values=depth_range_samples, 
+                                          num_depth=self.ndepths[stage_idx],
+                                          cost_regularization=self.cost_regularization if self.share_cr else self.cost_regularization[stage_idx])
+
+            depth = outputs_stage['depth']
+            outputs_stage["depth_range_samples"] = depth_range_samples
+            outputs_stage["depth_near_far"] = near_far
+
+            outputs["stage{}".format(stage_idx + 1)] = outputs_stage
+            outputs.update(outputs_stage)
+
+        # depth map refinement
+        if self.refine:
+            refined_depth = self.refine_network(ref_img, depth, features, depth_values)
+            outputs["depth"] = refined_depth
+
+        return outputs
+    
+    
+    def forward(self, imgs, proj_matrices, depth_values, outer_features=None):
+        b, v, c, h, w = imgs.shape
+        if outer_features == None:
+            # step 1. feature extraction
+            features = self.feature(imgs) # {'stage1': (B, V, C, H, W), ...}
+        else: 
+            # use outer features
+            features = outer_features
+
+        outputs_list = []
+        for vi in range(v):
+            outputs = self.backbone(imgs[:, vi], features, proj_matrices, depth_values[:, vi, :], imgs.shape)
+            outputs_list.append(outputs)
+            # switch to next image
+            # features.append(features.pop(0))
+            for stage in proj_matrices:
+                features[stage] = features[stage].roll(dims=1, shifts=-1)
+                proj_matrices[stage] = proj_matrices[stage].roll(dims=1, shifts=-1)
+        
+        return outputs_list

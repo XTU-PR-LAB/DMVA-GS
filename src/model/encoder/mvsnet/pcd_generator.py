@@ -1,0 +1,257 @@
+import numpy as np
+import cv2
+import open3d.visualization
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import open3d as o3d
+from dataclasses import dataclass
+from .cas_mvsnet import CascadeMVSNet
+
+@dataclass
+class MVSNetCfg:
+    model: str
+    ckpt_path: str
+
+
+def adapt_mvsnet_state_dict(state_dict: dict):
+    """
+    this function will remove every prefix string of key `module.` in `state_dict.model`
+    which was appended by executing `nn.DataParallel(model)`
+    """
+    model: dict = state_dict["model"]
+    origin_keys = [key for key in model]
+        
+    for key in origin_keys:
+        update_key = key[7:]
+        model[update_key] = model[key]
+        model.pop(key)
+        
+    return state_dict
+
+# project the reference point cloud into the source view, then project back
+def reproject_with_depth(depth_ref, intrinsics_ref, extrinsics_ref, depth_src, intrinsics_src, extrinsics_src):
+    batch, height, width = depth_ref.shape
+    ## step1. project reference pixels to the source view
+    # reference view x, y
+    x_ref, y_ref = torch.meshgrid(torch.arange(0, width, device="cuda"), torch.arange(0, height, device="cuda"), indexing='xy')
+    x_ref, y_ref = x_ref.repeat(batch, 1, 1).reshape(batch, -1), y_ref.repeat(batch, 1, 1).reshape(batch, -1)
+    # reference 3D space
+    ones = torch.ones_like(x_ref, device="cuda")
+    ref_homogeneous = torch.stack((x_ref, y_ref, ones), dim=1)
+    xyz_ref = torch.matmul(torch.linalg.inv(intrinsics_ref), ref_homogeneous * depth_ref.reshape(batch, 1, -1).repeat(1, 3, 1)) # (B, C, H*W)
+    # source 3D space
+    xyz_src = torch.matmul(torch.matmul(torch.linalg.inv(extrinsics_src), torch.linalg.inv(extrinsics_ref)),
+                        torch.cat((xyz_ref, ones.unsqueeze(1)), dim=1))[:, :3, :] # (B, 3, H*W)
+    # source view x, y
+    K_xyz_src = torch.matmul(intrinsics_src, xyz_src)
+    xy_src = K_xyz_src[:, :2, :] / K_xyz_src[:, 2:3, :]
+
+    ## step2. reproject the source view points with source view depth estimation
+    # find the depth estimation of the source view
+    x_src = xy_src[:, 0, :].reshape([batch, height, width])
+    y_src = xy_src[:, 1, :].reshape([batch, height, width])
+    # # Prepare the source view grid for remap
+    grid = torch.stack((x_src, y_src), dim=-1)  # [B, height, width, 2]
+    grid = 2.0 * grid / torch.tensor([height - 1, width - 1], dtype=torch.float32, device="cuda") - 1.0  # Normalizing the grid to [-1, 1]
+
+    # # Sample the source depth using bilinear interpolation
+    sampled_depth_src = F.grid_sample(depth_src.unsqueeze(1), grid, mode='bilinear', padding_mode='zeros').squeeze(1)
+
+    # source 3D space
+    # NOTE that we should use sampled source-view depth_here to project back
+    xyz_src = torch.matmul(torch.linalg.inv(intrinsics_src),
+                        torch.cat((xy_src, ones.unsqueeze(1)), dim=1) * sampled_depth_src.reshape(batch, 1, -1).repeat(1, 3, 1))
+    # reference 3D space
+    xyz_reprojected = torch.matmul(torch.matmul(torch.linalg.inv(extrinsics_ref), torch.linalg.inv(extrinsics_src)),
+                                torch.cat((xyz_src, ones.unsqueeze(1)), dim=1))[:, :3, :]
+    # source view x, y, depth
+    depth_reprojected = xyz_reprojected[:, 2, :].reshape([batch, height, width])
+    K_xyz_reprojected = torch.matmul(intrinsics_ref, xyz_reprojected)
+    xy_reprojected = K_xyz_reprojected[:, :2, :] / K_xyz_reprojected[:, 2:3, :]
+    x_reprojected = xy_reprojected[:, 0, :].reshape([batch, height, width])
+    y_reprojected = xy_reprojected[:, 1, :].reshape([batch, height, width])
+
+    return depth_reprojected, x_reprojected, y_reprojected, x_src, y_src
+
+
+def check_geometric_consistency(
+    depth_ref: torch.Tensor, 
+    intrinsics_ref: torch.Tensor, 
+    extrinsics_ref: torch.Tensor, 
+    depth_src: torch.Tensor, 
+    intrinsics_src: torch.Tensor, 
+    extrinsics_src: torch.Tensor,
+    near_fars: torch.Tensor, # (B, 2)
+    max_dist=0.001, 
+    max_depth_diff=0.001):
+    
+    width, height = depth_ref.shape[2], depth_ref.shape[1]
+    x_ref, y_ref = torch.meshgrid(torch.arange(0, width, device="cuda"), torch.arange(0, height, device="cuda"), indexing='xy')
+    
+    depth_reprojected, x2d_reprojected, y2d_reprojected, x2d_src, y2d_src = reproject_with_depth(depth_ref, intrinsics_ref, extrinsics_ref,
+                                                    depth_src, intrinsics_src, extrinsics_src)
+    # check |p_reproj-p_1| < 1
+    dist = torch.sqrt((x2d_reprojected - x_ref) ** 2 + (y2d_reprojected - y_ref) ** 2)
+
+    # check |d_reproj-d_1| / d_1 < 0.01
+    depth_diff = torch.abs(depth_reprojected - depth_ref)
+    relative_depth_diff = depth_diff / depth_ref
+
+    # mask = torch.logical_and(dist < 1, relative_depth_diff < 0.01)
+    mask = torch.logical_and(dist < ((width + height) / 2) * max_dist, relative_depth_diff < (near_fars[:, 1].view(-1, 1, 1) - near_fars[:, 0].view(-1, 1, 1)) * max_depth_diff)
+    depth_reprojected[~mask] = 0
+
+    return mask, depth_reprojected, x2d_src, y2d_src
+
+@torch.no_grad()
+def generate_geometric_mask(
+    imgs: torch.Tensor, 
+    extrinsics: torch.Tensor, 
+    intrinsics: torch.Tensor, 
+    depths_est: list[torch.Tensor], 
+    near_fars: torch.Tensor, # (B, V, 2)
+    ref_idx=0, 
+    max_dist=0.001, 
+    max_depth_diff=0.001):
+    """
+    ### Generate geometric mask for a given reference image and a set of source images
+    Note that an averaged reprojected depth will be returned.
+    """
+    b, v, c, h, w = imgs.shape
+    all_srcview_depth_ests = []
+    all_srcview_x = []
+    all_srcview_y = []
+    all_srcview_geomask = []
+    ref_img, ref_depth_est, ref_intrinsics, ref_extrinsics = imgs[:, ref_idx, :, :, :], depths_est[ref_idx], intrinsics[:, ref_idx, :, :], extrinsics[:, ref_idx, :, :]
+    geo_mask_sum = torch.zeros_like(ref_depth_est, dtype=int)
+    
+    for src_idx in range(v):
+        if src_idx == ref_idx: continue
+        
+        geo_mask, depth_reprojected, x2d_src, y2d_src = check_geometric_consistency(
+            ref_depth_est, ref_intrinsics, ref_extrinsics,
+            depths_est[src_idx], intrinsics[:, src_idx, :, :], extrinsics[:, src_idx, :, :], 
+            near_fars=near_fars[:, src_idx], max_dist=max_dist, max_depth_diff=max_depth_diff)
+        
+        geo_mask_sum += geo_mask
+        all_srcview_depth_ests.append(depth_reprojected)
+        all_srcview_x.append(x2d_src)
+        all_srcview_y.append(y2d_src)
+        all_srcview_geomask.append(geo_mask)
+        pass
+    
+    depth_est_averaged = (sum(all_srcview_depth_ests) + depths_est[ref_idx]) / (geo_mask_sum + 1)
+    # at least half of source views matched
+    geo_mask = geo_mask_sum >= v // 2
+    
+    if False:
+        import cv2
+        far = 10
+        def interp_to_show(img):
+            return F.interpolate(img.unsqueeze(0).unsqueeze(0), size=(h, w), mode='bilinear').squeeze(0).squeeze(0)
+        # convert image color channel: rgb -> bgr
+        ref_img_bgr = torch.stack((ref_img[:, 2], ref_img[:, 1], ref_img[:, 0]), dim=1)
+        cv2.imshow('ref_img', np.array(ref_img_bgr[0].transpose(0, 1).transpose(1, 2).detach().cpu()))
+        cv2.imshow('ref_depth', np.array(interp_to_show(ref_depth_est[0]).detach().cpu()) / far)
+        cv2.imshow('ref_depth * photo_mask', np.array(interp_to_show(ref_depth_est[0] * photo_mask[0]).detach().cpu()) / far)
+        cv2.imshow('ref_depth * geo_mask', np.array(interp_to_show(ref_depth_est[0] * geo_mask[0]).detach().cpu()) / far)
+        cv2.imshow('ref_depth * mask', np.array(interp_to_show(ref_depth_est[0] * final_mask[0]).detach().cpu()) / far)
+        # cv2.waitKey(0)
+
+    return geo_mask, depth_est_averaged
+
+def generate_point_cloud_from_depth_maps(
+    imgs: torch.Tensor, 
+    extrinsics: torch.Tensor, 
+    intrinsics: torch.Tensor, 
+    depths_est: list[torch.Tensor], 
+    depth_values: torch.Tensor, 
+    max_dist=0.001, 
+    max_depth_diff=0.001):
+    """
+    # DEPRECATED
+    ### generete point cloud from depth maps, only points with geometry consistency will be selected.
+    """
+    
+    b, v, c, h, w = imgs.shape
+    # the final point cloud list (per batch)
+    vertices = [[] for _ in range(b)]
+    vertices_color = [[] for _ in range(b)]
+    # for every reference image and source image, compute the photometric mask and geometric mask
+    # and generate point cloud
+    for ref_idx in range(v):
+        geo_mask, depth_est_averaged = generate_geometric_mask(
+            imgs=imgs, 
+            extrinsics=extrinsics, 
+            intrinsics=intrinsics, 
+            depths_est=depths_est, 
+            near_fars=depth_values, 
+            ref_idx=ref_idx, 
+            max_dist=max_dist, 
+            max_depth_diff=max_depth_diff
+        )
+        ref_img, ref_depth_est, ref_intrinsics, ref_extrinsics = imgs[:, ref_idx, :, :, :], depths_est[ref_idx], intrinsics[:, ref_idx, :, :], extrinsics[:, ref_idx, :, :]
+        # project valid depth to 3d points
+        # Note that we filter the valid point at last to facilitate batch parallel processing
+        height, width = depth_est_averaged.shape[1:3]
+        x, y = torch.meshgrid(torch.arange(0, width, device="cuda"), torch.arange(0, height, device="cuda"), indexing='xy')
+        x, y = x.unsqueeze(0).repeat(b, 1, 1), y.unsqueeze(0).repeat(b, 1, 1)
+        # print("valid_points", valid_points.sum())
+        # x, y, depth = x[valid_points], y[valid_points], depth_est_averaged[valid_points]
+        uvd_ref = (torch.stack((x, y, torch.ones_like(x)), dim=1) * ref_depth_est.unsqueeze(1)).view(b, 3, -1)
+        xyz_ref = torch.matmul(torch.linalg.inv(ref_intrinsics), uvd_ref)
+        xyz_world = torch.matmul(ref_extrinsics,
+                            torch.cat((xyz_ref, torch.ones_like(x.view(b, 1, -1))), dim=1)) # (B, 4, H*W)
+        colors = ref_img.view(b, c, -1) # (B, C=3, H*W)
+        # colors = torch.rand(c).view(1, c, 1).repeat(b, 1, h*w).cuda() # show point from multi-view
+        
+        valid_points = geo_mask.reshape(b, -1) # (B, H*W)
+        for b_idx in range(b):
+            vertices[b_idx].append(xyz_world.transpose(1, 2)[b_idx][valid_points[b_idx]])
+            vertices_color[b_idx].append(colors.transpose(1, 2)[b_idx][valid_points[b_idx]])
+        
+    
+    # concat all vertices for every scene/batch
+    # every item in vertices (n_points, 4)
+    for b_idx in range(b):
+        vertices[b_idx] = torch.cat(vertices[b_idx], dim=0)
+        vertices_color[b_idx] = torch.cat(vertices_color[b_idx], dim=0)
+        
+    if False:
+        import open3d
+        pcd = open3d.geometry.PointCloud()
+        pcd.points = open3d.utility.Vector3dVector(vertices[0][:, :3].detach().cpu())
+        pcd.colors = open3d.utility.Vector3dVector(vertices_color[0].detach().cpu())
+        open3d.visualization.draw_geometries([pcd])
+        
+    return vertices, vertices_color # [(n_points, 4) * B], [(n_points, 3) * B]
+
+
+def generate_depth_map_based_point_cloud(
+    depths_est: list[torch.Tensor], 
+    extrinsics: torch.Tensor, 
+    intrinsics: torch.Tensor):
+    """
+    ### Generate depth map based point cloud (xyz with shape(B, H, W))
+    input:
+        depths_est: [Tensor(B, H, W) * V]
+        extrinsics: Tensor(B, V, 4, 4)
+        intrinsics: Tensor(B, V, 3, 3)
+        
+    output: Tensor(B, V, 4(xyz1), H, W)
+    """
+    
+    depths_est = torch.stack(depths_est, dim=1) # (B, V, H, W)
+    b, v, h, w = depths_est.shape
+    extrinsics, intrinsics = extrinsics.view(b*v, 4, 4), intrinsics.view(b*v, 3, 3)
+    # project probability volume to 3d points
+    x, y = torch.meshgrid(torch.arange(0, w, device=depths_est.device), torch.arange(0, h, device=depths_est.device), indexing='xy') # (H, W)
+    x, y = x.view(1, 1, h, w).repeat(b, v, 1, 1), y.view(1, 1, h, w).repeat(b, v, 1, 1) # (B, V, H, W)
+
+    uvd_ref = (torch.stack((x, y, torch.ones_like(x)), dim=2) * depths_est.unsqueeze(2)).view(b*v, 3, -1) # (B, V, 3, H, W) -> # (B*V, 3, H*W)
+    xyz_ref = torch.matmul(torch.linalg.inv(intrinsics), uvd_ref) # (B*V, 3, H*W)
+    xyz_world = torch.matmul(extrinsics,
+                        torch.cat((xyz_ref, torch.ones(b * v, 1, h * w, device=depths_est.device)), dim=1)) # (B*V, 4, H*W)
+
+    return xyz_world.view(b, v, 4, h, w)

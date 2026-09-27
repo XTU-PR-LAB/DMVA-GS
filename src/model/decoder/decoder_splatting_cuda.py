@@ -1,0 +1,104 @@
+from dataclasses import dataclass
+from typing import Literal
+
+import torch
+from einops import rearrange, repeat
+from jaxtyping import Float
+from torch import Tensor
+
+from ...utils import build_covariance_from_scaling_rotation
+
+from ...dataset import DatasetCfg
+from ..types import EncoderOutput
+from .cuda_splatting import DepthRenderingMode, render_cuda, render_depth_cuda
+from .decoder import Decoder, DecoderOutput
+
+
+@dataclass
+class DecoderSplattingCUDACfg:
+    name: Literal["splatting_cuda"]
+    background_color: list[float]
+
+
+class DecoderSplattingCUDA(Decoder[DecoderSplattingCUDACfg]):
+    background_color: Float[Tensor, "3"]
+
+    def __init__(
+        self,
+        cfg: DecoderSplattingCUDACfg,
+    ) -> None:
+        super().__init__(cfg)
+        self.register_buffer(
+            "background_color",
+            torch.tensor(cfg.background_color, dtype=torch.float32),
+            persistent=False,
+        )
+
+    def forward(
+        self,
+        gaussians: EncoderOutput,
+        extrinsics: Float[Tensor, "batch view 4 4"],
+        intrinsics: Float[Tensor, "batch view 3 3"],
+        near: Float[Tensor, "batch view"],
+        far: Float[Tensor, "batch view"],
+        image_shape: tuple[int, int],
+        depth_mode: DepthRenderingMode | None = None,
+    ) -> DecoderOutput:
+        b, v, _, _ = extrinsics.shape
+        _, g, _ = gaussians.means.shape
+        # the cuda operator can NOT handle the situation of 0 gaussian
+        # it will throw `RuntimeError: Function _RasterizeGaussiansBackward returned an invalid gradient at index 2 - got [0, 0, 3] but expected shape compatible with [0, 9, 3]` during backward pass
+        # so we need to check if there are any gaussians
+        if g == 0:
+            # return empty color and depth
+            color = torch.zeros((b, v, 3, *image_shape), dtype=torch.float32, device=extrinsics.device)
+            depth = None if depth_mode is None else torch.zeros((b, v, *image_shape), dtype=torch.float32, device=extrinsics.device)
+            return DecoderOutput(color, depth)
+        
+        color = render_cuda(
+            rearrange(extrinsics, "b v i j -> (b v) i j"),
+            rearrange(intrinsics, "b v i j -> (b v) i j"),
+            rearrange(near, "b v -> (b v)"),
+            rearrange(far, "b v -> (b v)"),
+            image_shape,
+            repeat(self.background_color, "c -> (b v) c", b=b, v=v),
+            repeat(gaussians.means, "b g xyz -> (b v) g xyz", v=v),
+            repeat(build_covariance_from_scaling_rotation(gaussians.scales.view(b*g, 3), 1, gaussians.rotations.view(b*g, 4)).reshape(b, g, 3, 3), "b g i j -> (b v) g i j", v=v),
+            repeat(gaussians.harmonics, "b g c d_sh -> (b v) g c d_sh", v=v),
+            repeat(gaussians.opacities, "b g -> (b v) g", v=v),
+        )
+        color = rearrange(color, "(b v) c h w -> b v c h w", b=b, v=v)
+
+        return DecoderOutput(
+            color,
+            None
+            if depth_mode is None
+            else self.render_depth(
+                gaussians, extrinsics, intrinsics, near, far, image_shape, depth_mode
+            ),
+        )
+
+    def render_depth(
+        self,
+        gaussians: EncoderOutput,
+        extrinsics: Float[Tensor, "batch view 4 4"],
+        intrinsics: Float[Tensor, "batch view 3 3"],
+        near: Float[Tensor, "batch view"],
+        far: Float[Tensor, "batch view"],
+        image_shape: tuple[int, int],
+        mode: DepthRenderingMode = "depth",
+    ) -> Float[Tensor, "batch view height width"]:
+        b, v, _, _ = extrinsics.shape
+        _, g, _ = gaussians.means.shape
+        result = render_depth_cuda(
+            rearrange(extrinsics, "b v i j -> (b v) i j"),
+            rearrange(intrinsics, "b v i j -> (b v) i j"),
+            rearrange(near, "b v -> (b v)"),
+            rearrange(far, "b v -> (b v)"),
+            image_shape,
+            repeat(gaussians.means, "b g xyz -> (b v) g xyz", v=v),
+            repeat(build_covariance_from_scaling_rotation(gaussians.scales.view(b*g, 3), 1, gaussians.rotations.view(b*g, 4)).reshape(b, g, 3, 3), "b g i j -> (b v) g i j", v=v),
+            repeat(gaussians.opacities, "b g -> (b v) g", v=v),
+            mode=mode,
+        )
+        return rearrange(result, "(b v) h w -> b v h w", b=b, v=v)

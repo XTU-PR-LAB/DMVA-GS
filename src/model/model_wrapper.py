@@ -1,0 +1,885 @@
+from dataclasses import dataclass
+import time
+from typing import Optional, Protocol, runtime_checkable
+import gc
+import moviepy.editor as mpy
+import torch
+from tqdm import tqdm
+import wandb
+from einops import pack, rearrange, repeat
+from jaxtyping import Float
+from pytorch_lightning import LightningModule
+from pytorch_lightning.loggers.wandb import WandbLogger
+from pytorch_lightning.utilities import rank_zero_only
+from torch import Tensor, nn, optim
+import numpy as np
+import json
+from pathlib import Path
+
+from ..visualization import network_gui
+from .ply_export import export_ply
+from ..dataset.data_module import get_data_shim
+from ..dataset.types import BatchedExample
+from ..dataset import DatasetCfg
+from ..evaluation.metrics import compute_lpips, compute_psnr, compute_ssim
+from ..global_cfg import get_cfg
+from ..loss import Loss
+from ..misc.benchmarker import Benchmarker
+from ..misc.image_io import prep_image, save_image, save_video
+from ..misc.LocalLogger import LOG_PATH, LocalLogger
+from ..misc.step_tracker import StepTracker
+from ..visualization.annotation import add_label
+from ..visualization.camera_trajectory.interpolation import (
+    interpolate_extrinsics,
+    interpolate_intrinsics,
+)
+from ..visualization.camera_trajectory.wobble import (
+    generate_wobble,
+    generate_wobble_transformation,
+)
+from ..visualization.color_map import apply_color_map_to_image
+from ..visualization.layout import add_border, hcat, vcat
+from ..visualization import layout
+from ..visualization.validation_in_3d import render_cameras, render_projections
+from .decoder.decoder import Decoder, DecoderOutput, DepthRenderingMode
+from .encoder import Encoder
+from .encoder.encoder_costvolume_incremental import EncoderCostVolumeIncremental
+from .encoder.visualization.encoder_visualizer import EncoderVisualizer
+from .types import EncoderOutput, TrainCfg, TestCfg, OptimizerCfg, FineTuneGaussianWrapper
+from ..utils import l1_loss, ssim as ssim_fn
+    
+
+@runtime_checkable
+class TrajectoryFn(Protocol):
+    def __call__(
+        self,
+        t: Float[Tensor, " t"],
+    ) -> tuple[
+        Float[Tensor, "batch view 4 4"],  # extrinsics
+        Float[Tensor, "batch view 3 3"],  # intrinsics
+    ]:
+        pass
+
+
+class ModelWrapper(LightningModule):
+    logger: Optional[WandbLogger]
+    encoder: Encoder
+    encoder_visualizer: Optional[EncoderVisualizer]
+    decoder: Decoder
+    losses: nn.ModuleList
+    optimizer_cfg: OptimizerCfg
+    test_cfg: TestCfg
+    train_cfg: TrainCfg
+    step_tracker: StepTracker | None
+
+    def __init__(
+        self,
+        optimizer_cfg: OptimizerCfg,
+        test_cfg: TestCfg,
+        train_cfg: TrainCfg,
+        encoder: Encoder,
+        encoder_visualizer: Optional[EncoderVisualizer],
+        decoder: Decoder,
+        losses: list[Loss],
+        step_tracker: StepTracker | None,
+    ) -> None:
+        super().__init__()
+        self.optimizer_cfg = optimizer_cfg
+        self.test_cfg = test_cfg
+        self.train_cfg = train_cfg
+        self.step_tracker = step_tracker
+        # Set up the model.
+        
+        # initialize pretrained mvsnet
+        self.encoder = encoder
+        self.encoder_visualizer = encoder_visualizer
+        self.decoder = decoder
+        self.data_shim = get_data_shim(self.encoder)
+        self.losses = nn.ModuleList(losses)
+        
+        # compute time remains
+        self.last_timestamp = time.time()
+
+        # This is used for testing.
+        self.benchmarker = Benchmarker()
+        self.eval_cnt = 0
+
+        if self.test_cfg.compute_scores:
+            self.test_step_outputs = {}
+            self.time_skip_steps_dict = {"encoder": 0, "decoder": 0, "fine_tune": 0}
+            self.average_score = {
+                "psnr": 0.0,
+                "ssim": 0.0,
+                "lpips": 0.0,
+            }
+            
+        if self.test_cfg.use_network_gui:
+            network_gui.init()
+
+    def training_step(self, batch, batch_idx):
+        batch: BatchedExample = self.data_shim(batch)
+        _, _, _, h, w = batch["target"]["image"].shape
+        
+        # if use our Encoder, we need to set render_callback for spliting voxels. every step we need to update it because the variable in closure is different.
+        if type(self.encoder) in (EncoderCostVolumeIncremental, ):
+            def render_callback(gaussians: EncoderOutput, scale: int) -> DecoderOutput:
+                prop = 1.0 / scale
+                output = self.decoder.forward(
+                    gaussians,
+                    batch["target"]["extrinsics"],
+                    batch["target"]["intrinsics"],
+                    batch["target"]["near"],
+                    batch["target"]["far"],
+                    (int(h * prop), int(w * prop)),
+                    depth_mode=self.train_cfg.depth_mode,
+                )
+                return output
+                
+            self.encoder.render_callback = render_callback
+            batch["max_steps"] = self.trainer.max_steps
+
+        # Run the model.
+        gaussians: EncoderOutput = self.encoder(
+            batch["context"], self.global_step, False, scene_names=batch["scene"]
+        )
+
+        if type(self.encoder) in (EncoderCostVolumeIncremental, ):
+            output = gaussians.others["stage_renders"][gaussians.others["stages"][-1]]
+        else:
+            output = self.decoder.forward(
+                gaussians,
+                batch["target"]["extrinsics"],
+                batch["target"]["intrinsics"],
+                batch["target"]["near"],
+                batch["target"]["far"],
+                (h, w),
+                depth_mode=self.train_cfg.depth_mode,
+            )
+        target_gt = batch["target"]["image"]
+
+        # Compute metrics.
+        psnr_probabilistic = compute_psnr(
+            rearrange(target_gt, "b v c h w -> (b v) c h w"),
+            rearrange(output.color, "b v c h w -> (b v) c h w"),
+        )
+        self.log("train/psnr_probabilistic", psnr_probabilistic.mean())
+
+        # Compute and log loss.
+        total_loss, total_weight = 0., 0.
+        loss_str = ""
+        for loss_fn in self.losses:
+            loss = loss_fn.forward(output, batch, gaussians, self.global_step)
+            self.log(f"loss/{loss_fn.name}", loss)
+            total_loss = total_loss + loss * loss_fn.cfg.weight
+            total_weight += loss_fn.cfg.weight
+            # total_loss = total_loss + loss / loss.detach() # autoloss
+            # total_weight += 1.0
+            loss_str += f"{loss_fn.name}: {loss:.6} * {loss_fn.cfg.weight}; "
+        total_loss /= total_weight
+        self.log("loss/total", total_loss)
+        
+        self.log(f"scale_from_umeyama", gaussians.others.get("s", torch.tensor(-1.0)).mean())
+        self.log("depth_gt_mean", gaussians.others.get("depth_gt_mean", torch.tensor(-1.0)))
+        self.log("depth_pred_mean", gaussians.others.get("depth_pred_mean", torch.tensor(-1.0)))
+
+        if (
+            self.global_rank == 0
+            and self.global_step % self.train_cfg.print_log_every_n_steps == 0
+        ):
+            # compute time remaininging
+            timestamp = time.time()
+            elapsed_seconds_per_step = (timestamp - self.last_timestamp) / self.train_cfg.print_log_every_n_steps
+            self.last_timestamp = timestamp
+            print(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]: "
+                f"train step {self.global_step}; "
+                f"time remaining(hours) = {((self.trainer.max_steps - self.global_step) * elapsed_seconds_per_step / 3600):.2f}; "
+                f"scale_from_umeyama = {gaussians.others.get('s', torch.tensor(-1.0)).mean():.6f}; "
+                f"depth_gt_mean = {gaussians.others.get('depth_gt_mean', torch.tensor(-1.0)):.6f}; "
+                f"depth_pred_mean = {gaussians.others.get('depth_pred_mean', torch.tensor(-1.0)):.6f}; "
+                f"scene = {[x for x in batch['scene']]}; "
+                f"context = {batch['context']['index'].tolist()}; "
+                f"target = {batch['target']['index'].tolist()}; "
+                # f"bound = {gaussians.others['bbox'].size.detach().cpu().numpy().mean()}; "
+                f"gaussians = {gaussians.opacities.shape[1]}; "
+                f"loss = [{loss_str}]; "
+                f"total loss = {total_loss:.6f}; "
+            )
+        self.log("info/near", batch["context"]["near"].detach().cpu().numpy().mean())
+        self.log("info/far", batch["context"]["far"].detach().cpu().numpy().mean())
+        self.log("info/global_step", self.global_step)  # hack for ckpt monitor
+
+        # Tell the data loader processes about the current step.
+        if self.step_tracker is not None:
+            self.step_tracker.set_step(self.global_step)
+            
+        if total_loss.isnan().any():
+            print(f"NaN loss encountered at step {self.global_step}.")
+            print(
+                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}]: "
+                f"train step {self.global_step}; "
+                f"scene = {[x for x in batch['scene']]}; "
+                f"context = {batch['context']['index'].tolist()}; "
+                f"target = {batch['target']['index'].tolist()}; "
+                # f"bound = {gaussians.others['bbox'].size.detach().cpu().numpy().mean()}; "
+                f"gaussians = {gaussians.opacities.shape[1]}; "
+                f"loss = [{loss_str}]; "
+                f"total loss = {total_loss:.6f}; "
+            )
+            print("jumpping to next step, skipping this step.")
+            self.log("nan_events", 1, on_step=True)
+            return None
+
+        return total_loss
+    
+    # def on_after_backward(self):
+    #     # 监控梯度统计信息
+    #     for name, param in self.named_parameters():
+    #         if param.grad is not None:
+    #             grad = param.grad
+    #             self.log(f"grad/{name}_mean", grad.mean())
+    #             self.log(f"grad/{name}_max", grad.max())
+    #             self.log(f"grad/{name}_min", grad.min())
+                
+    #             # 检测 NaN
+    #             if torch.isnan(grad).any():
+    #                 print(f"NaN gradients in {name}!")
+
+    def test_step(self, batch, batch_idx):
+        batch: BatchedExample = self.data_shim(batch)
+        b, v, c, h, w = batch["target"]["image"].shape
+        assert b == 1
+
+        # Render Gaussians.
+        with self.benchmarker.time("encoder"):
+            gaussians: EncoderOutput = self.encoder(
+                batch["context"],
+                self.global_step,
+                deterministic=False,
+            )
+            
+        print(f"\nRendering scene {batch['scene']} with {gaussians.opacities.shape[1]} gaussians")
+        
+        with self.benchmarker.time("decoder", num_calls=b*v):
+            output = self.decoder.forward(
+                gaussians,
+                batch["target"]["extrinsics"],
+                batch["target"]["intrinsics"],
+                batch["target"]["near"],
+                batch["target"]["far"],
+                (h, w),
+                depth_mode="depth",
+            )
+            
+        if self.test_cfg.use_network_gui:
+            render_gaussians = gaussians
+            (scene,) = batch["scene"]
+            dataset_verify_path = (Path(self.test_cfg.dataset_verify_path) / scene.split("_")[1])
+            
+            def render_func(custom_cam: network_gui.MiniCam, scaling_modifier: float):
+                render_gaussians.scales *= scaling_modifier
+                net_image = self.decoder.forward(
+                    gaussians=render_gaussians, 
+                    extrinsics=custom_cam.extrinsics.view(1, 1, 4, 4), # 
+                    # extrinsics=batch["context"]["extrinsics"][0:1, 0:1], # c2w, debug only
+                    intrinsics=custom_cam.normalized_intrinsics.view(1, 1, 3, 3),
+                    near=torch.tensor([[custom_cam.znear]], device=gaussians.means.device),
+                    far=torch.tensor([[custom_cam.zfar]], device=gaussians.means.device),
+                    image_shape=(custom_cam.image_height, custom_cam.image_width),
+                    depth_mode=None,
+                ).color.view(c, custom_cam.image_height, custom_cam.image_width)
+                render_gaussians.scales /= scaling_modifier
+                return net_image
+        
+            network_gui.update(
+                render_func=render_func, 
+                dataset_verify_path=dataset_verify_path, 
+                lock_once=True
+            )
+        
+        if self.test_cfg.fine_tune:
+            proc = tqdm(range(self.test_cfg.fine_tune_cfg.fine_tune_steps), desc="fine tune process")
+            with torch.inference_mode(False):
+                fine_tune_gaussian_wrapper = FineTuneGaussianWrapper(gaussians, self.test_cfg.fine_tune_cfg)
+                gt = batch["fine_tune"]["image"].clone() # clone to get a non-inference mode tensor.
+                _, v_ft, _, _, _ = gt.shape
+                for i in proc:
+                    if self.test_cfg.use_network_gui:
+                        render_gaussians = fine_tune_gaussian_wrapper.get_gaussians()
+                        network_gui.update(
+                            render_func=render_func, 
+                            dataset_verify_path=dataset_verify_path, 
+                            lock_once=False
+                        )
+                    with self.benchmarker.time("fine_tune"):
+                        output_ft = self.decoder.forward(
+                            fine_tune_gaussian_wrapper.get_gaussians(),
+                            batch["fine_tune"]["extrinsics"],
+                            batch["fine_tune"]["intrinsics"],
+                            batch["fine_tune"]["near"],
+                            batch["fine_tune"]["far"],
+                            (h, w),
+                            depth_mode=None,
+                        )
+                        # compute loss
+                        Ll1 = l1_loss(output_ft.color, gt)
+                        l_ssim = 1 - ssim_fn(output_ft.color.view(b*v_ft, c, h, w), gt.view(b*v_ft, c, h, w))
+                        proc.set_postfix({
+                            'l1': Ll1.item(), 
+                            'ssim': 1 - l_ssim.item()
+                        })
+                        loss = (1.0 - self.test_cfg.fine_tune_cfg.lambda_dssim) * Ll1 + self.test_cfg.fine_tune_cfg.lambda_dssim * l_ssim
+                        loss.backward()
+                        # optimizer step
+                        fine_tune_gaussian_wrapper.step()
+                        pass # with self.benchmarker.time("fine_tune"):
+                    pass # for i in proc:
+                pass # with torch.inference_mode(False):
+            if self.test_cfg.use_network_gui:
+                network_gui.update(
+                    render_func=render_func, 
+                    dataset_verify_path=dataset_verify_path, 
+                    lock_once=True
+                )
+            fine_tuned_gaussians = fine_tune_gaussian_wrapper.get_gaussians()
+            output_ft = self.decoder.forward(
+                fine_tuned_gaussians,
+                batch["target"]["extrinsics"],
+                batch["target"]["intrinsics"],
+                batch["target"]["near"],
+                batch["target"]["far"],
+                (h, w),
+                depth_mode="depth",
+            ) # render target frames.
+            pass # if self.test_cfg.fine_tune:
+        
+
+        name = get_cfg()["wandb"]["name"]
+        (scene,) = batch["scene"]
+        path = self.test_cfg.output_path / name
+        images_prob = output.color[0]
+        images_prob_ft = output_ft.color[0] if self.test_cfg.fine_tune else images_prob
+        depth_prob = output.depth[0]
+        depth_prob_ft = output_ft.depth[0] if self.test_cfg.fine_tune else depth_prob
+        rgb_gt = batch["target"]["image"][0]
+        
+        # Construct comparison image.
+        def depth_map(result):
+            result = result + 1e-6
+            result = result.log()
+            result = 1 - ((result - result.min()) / (result.max() - result.min()))
+            return apply_color_map_to_image(result, "turbo")
+
+        # Save images.
+        if self.test_cfg.save_image:
+            for index, color in zip(batch["context"]["index"][0], batch["context"]["image"][0]):
+                save_image(color, path / scene / f"context/{index:0>6}.png")
+            for index, color, depth, color_ft, color_gt in zip(batch["target"]["index"][0], images_prob, depth_prob, images_prob_ft, rgb_gt):
+                save_image(color, path / scene / f"color/{index:0>6}.png")
+                save_image(depth_map(depth), path / scene / f"depth/{index:0>6}.png")
+                save_image(color_gt, path / scene / f"color/{index:0>6}_gt.png")
+                if self.test_cfg.fine_tune:
+                    save_image(color_ft, path / scene / f"color/{index:0>6}_ft.png")
+
+        # save video
+        if self.test_cfg.save_video:
+            self.render_video_interpolation(gaussians, batch)
+            if self.test_cfg.fine_tune:
+                self.render_video_interpolation(fine_tuned_gaussians, batch, name="rgb_ft")
+            frame_str = "_".join([str(x.item()) for x in batch["context"]["index"][0]])
+            save_video(
+                [a for a in images_prob],
+                path / "video" / f"{scene}_frame_{frame_str}.mp4",
+            )
+
+        if False:
+            # Draw cameras.
+            cameras = hcat(*render_cameras(batch, 256))
+            self.logger.log_image(
+                "cameras", [prep_image(add_border(cameras))], step=self.global_step
+            )
+
+            if self.encoder_visualizer is not None:
+                for k, image in self.encoder_visualizer.visualize(
+                    batch["context"], self.global_step
+                ).items():
+                    self.logger.log_image(k, [prep_image(image)], step=self.global_step)
+        
+        if True:
+            comparison = hcat(
+                add_label(vcat(*batch["context"]["image"][0]), "Context"),
+                add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
+                add_label(vcat(*torch.cat((images_prob, images_prob_ft))), "Target (w/o | w fine-tune)"),
+                add_label(vcat(*torch.cat((depth_map(depth_prob), depth_map(depth_prob_ft)))), "Target depth (w/o | w fine-tune)"),
+            )
+            self.logger.log_image(
+                f"comparison_{scene}",
+                [prep_image(add_border(comparison))],
+                step=self.global_step,
+                caption=batch["scene"],
+            )
+            
+        if True:
+            # Render projections and construct projection image.
+            projections = hcat(*render_projections(
+                                    gaussians,
+                                    256,
+                                    extra_label="(Softmax)",
+                                )[0])
+            self.logger.log_image(
+                f"projection_{scene}",
+                [prep_image(add_border(projections))],
+                step=self.global_step,
+            )
+            if self.test_cfg.fine_tune:
+                projections = hcat(*render_projections(
+                                        fine_tuned_gaussians,
+                                        256,
+                                        extra_label="(Softmax)",
+                                    )[0])
+                self.logger.log_image(
+                    "projection_ft",
+                    [prep_image(add_border(projections))],
+                    step=self.global_step,
+                )
+        
+        if self.test_cfg.export_ply:
+            export_ply(
+                extrinsics=batch["context"]["extrinsics"][0, 0],
+                means=gaussians.means[0],
+                scales=gaussians.scales[0],
+                rotations=gaussians.rotations[0],
+                harmonics=gaussians.harmonics[0],
+                opacities=gaussians.opacities[0],
+                path=path / scene / "gaussians.ply",
+            )
+            if self.test_cfg.fine_tune:
+                export_ply(
+                    extrinsics=batch["context"]["extrinsics"][0, 0],
+                    means=fine_tuned_gaussians.means[0],
+                    scales=fine_tuned_gaussians.scales[0],
+                    rotations=fine_tuned_gaussians.rotations[0],
+                    harmonics=fine_tuned_gaussians.harmonics[0],
+                    opacities=fine_tuned_gaussians.opacities[0],
+                    path=path / scene / "fine_tuned_gaussians.ply",
+                )
+        
+        del gaussians
+        if self.test_cfg.fine_tune:
+            del fine_tuned_gaussians
+                    
+        # compute scores
+        if self.test_cfg.compute_scores:
+            rgb = images_prob
+            rgb_ft = images_prob_ft
+
+            if f"psnr" not in self.test_step_outputs:
+                self.test_step_outputs[f"psnr"] = []
+            if f"ssim" not in self.test_step_outputs:
+                self.test_step_outputs[f"ssim"] = []
+            if f"lpips" not in self.test_step_outputs:
+                self.test_step_outputs[f"lpips"] = []
+            if f"psnr_ft" not in self.test_step_outputs:
+                self.test_step_outputs[f"psnr_ft"] = []
+            if f"ssim_ft" not in self.test_step_outputs:
+                self.test_step_outputs[f"ssim_ft"] = []
+            if f"lpips_ft" not in self.test_step_outputs:
+                self.test_step_outputs[f"lpips_ft"] = []
+                
+            psnr = compute_psnr(rgb_gt, rgb).mean().item()
+            ssim = compute_ssim(rgb_gt, rgb).mean().item()
+            lpips = compute_lpips(rgb_gt, rgb).mean().item()
+            psnr_ft = compute_psnr(rgb_gt, rgb_ft).mean().item()
+            ssim_ft = compute_ssim(rgb_gt, rgb_ft).mean().item()
+            lpips_ft = compute_lpips(rgb_gt, rgb_ft).mean().item()
+            
+            self.test_step_outputs[f"psnr"].append(psnr)
+            self.test_step_outputs[f"ssim"].append(ssim)
+            self.test_step_outputs[f"lpips"].append(lpips)
+            self.test_step_outputs[f"psnr_ft"].append(psnr_ft)
+            self.test_step_outputs[f"ssim_ft"].append(ssim_ft)
+            self.test_step_outputs[f"lpips_ft"].append(lpips_ft)
+            
+            # compute average score for all scenes
+            if self.eval_cnt > 0:
+                prod_coef = self.eval_cnt / (self.eval_cnt + 1)
+                self.average_score["psnr"] = (self.average_score["psnr"] * prod_coef) + (psnr / (self.eval_cnt + 1))
+                self.average_score["ssim"] = (self.average_score["ssim"] * prod_coef) + (ssim / (self.eval_cnt + 1))
+                self.average_score["lpips"] = (self.average_score["lpips"] * prod_coef) + (lpips / (self.eval_cnt + 1))
+            else:
+                self.average_score["psnr"] = psnr
+                self.average_score["ssim"] = ssim
+                self.average_score["lpips"] = lpips
+            
+            print()
+            print(f"Evaluate scene {batch['scene']}: ")
+            print(f"PSNR(origin/ft/avg): {psnr}/{psnr_ft}/{self.average_score['psnr']}")
+            print(f"SSIM(origin/ft/avg): {ssim}/{ssim_ft}/{self.average_score['ssim']}")
+            print(f"LPIPS(origin/ft/avg): {lpips}/{lpips_ft}/{self.average_score['lpips']}")
+            print()
+            
+            # append scene results
+            if "scene_result" not in self.test_step_outputs:
+                self.test_step_outputs["scene_result"] = {}
+            scene_name = scene[:-3] # remove test view id
+            if scene_name not in self.test_step_outputs["scene_result"]:
+                self.test_step_outputs["scene_result"][scene_name] = {}
+                
+            if "psnr" not in self.test_step_outputs["scene_result"][scene_name]:
+                self.test_step_outputs["scene_result"][scene_name]["psnr"] = []
+            if "ssim" not in self.test_step_outputs["scene_result"][scene_name]:
+                self.test_step_outputs["scene_result"][scene_name]["ssim"] = []
+            if "lpips" not in self.test_step_outputs["scene_result"][scene_name]:
+                self.test_step_outputs["scene_result"][scene_name]["lpips"] = []
+            if "psnr_ft" not in self.test_step_outputs["scene_result"][scene_name]:
+                self.test_step_outputs["scene_result"][scene_name]["psnr_ft"] = []
+            if "ssim_ft" not in self.test_step_outputs["scene_result"][scene_name]:
+                self.test_step_outputs["scene_result"][scene_name]["ssim_ft"] = []
+            if "lpips_ft" not in self.test_step_outputs["scene_result"][scene_name]:
+                self.test_step_outputs["scene_result"][scene_name]["lpips_ft"] = []
+                
+            self.test_step_outputs["scene_result"][scene_name]["psnr"].append(psnr)
+            self.test_step_outputs["scene_result"][scene_name]["ssim"].append(ssim)
+            self.test_step_outputs["scene_result"][scene_name]["lpips"].append(lpips)
+            self.test_step_outputs["scene_result"][scene_name]["psnr_ft"].append(psnr_ft)
+            self.test_step_outputs["scene_result"][scene_name]["ssim_ft"].append(ssim_ft)
+            self.test_step_outputs["scene_result"][scene_name]["lpips_ft"].append(lpips_ft)
+            
+            self.eval_cnt += 1
+            
+
+    def on_test_end(self) -> None:
+        name = get_cfg()["wandb"]["name"]
+        out_dir = self.test_cfg.output_path / name
+        saved_scores = {}
+        if self.test_cfg.compute_scores:
+            self.benchmarker.dump_memory(out_dir / "peak_memory.json")
+            self.benchmarker.dump(out_dir / "benchmark.json")
+            
+            for scene_name in self.test_step_outputs["scene_result"]:
+                for metric_name, metric_scores in self.test_step_outputs["scene_result"][scene_name].items():
+                    avg_scores = sum(metric_scores) / len(metric_scores)
+                    saved_scores[metric_name] = avg_scores
+                    print(f"{scene_name}: {metric_name} {avg_scores}")
+                    metric_scores.clear()
+            self.test_step_outputs.pop("scene_result")
+
+            for metric_name, metric_scores in self.test_step_outputs.items():
+                avg_scores = sum(metric_scores) / len(metric_scores)
+                saved_scores[metric_name] = avg_scores
+                print(metric_name, avg_scores)
+                with (out_dir / f"scores_{metric_name}_all.json").open("w") as f:
+                    json.dump(metric_scores, f)
+                metric_scores.clear()
+
+            for tag, times in self.benchmarker.execution_times.items():
+                times = times[int(self.time_skip_steps_dict[tag]) :]
+                saved_scores[tag] = [len(times), np.mean(times)]
+                print(
+                    f"{tag}: {len(times)} calls, avg. {np.mean(times)} seconds per call"
+                )
+                self.time_skip_steps_dict[tag] = 0
+
+            with (out_dir / f"scores_all_avg.json").open("w") as f:
+                json.dump(saved_scores, f)
+            self.benchmarker.clear_history()
+        else:
+            self.benchmarker.dump(self.test_cfg.output_path / name / "benchmark.json")
+            self.benchmarker.dump_memory(
+                self.test_cfg.output_path / name / "peak_memory.json"
+            )
+            self.benchmarker.summarize()
+
+    @rank_zero_only
+    def validation_step(self, batch, batch_idx):
+        batch: BatchedExample = self.data_shim(batch)
+
+        if self.global_rank == 0:
+            print(
+                f"validation step {self.global_step}; "
+                f"scene = {[a[:20] for a in batch['scene']]}; "
+                f"context = {batch['context']['index'].tolist()}"
+            )
+
+        # Render Gaussians.
+        b, _, _, h, w = batch["target"]["image"].shape
+        assert b == 1
+        gaussians_softmax: EncoderOutput = self.encoder(
+            batch["context"],
+            self.global_step,
+            deterministic=False,
+        )
+        
+        if gaussians_softmax.means.shape[1] == 0: return # no gaussian
+        
+        output_softmax = self.decoder.forward(
+            gaussians_softmax,
+            batch["target"]["extrinsics"],
+            batch["target"]["intrinsics"],
+            batch["target"]["near"],
+            batch["target"]["far"],
+            (h, w),
+        )
+        rgb_softmax = output_softmax.color[0]
+
+        # Compute validation metrics.
+        rgb_gt = batch["target"]["image"][0]
+        for tag, rgb in zip(
+            ("val",), (rgb_softmax,)
+        ):
+            psnr = compute_psnr(rgb_gt, rgb).mean()
+            self.log(f"val/psnr_{tag}", psnr)
+            lpips = compute_lpips(rgb_gt, rgb).mean()
+            self.log(f"val/lpips_{tag}", lpips)
+            ssim = compute_ssim(rgb_gt, rgb).mean()
+            self.log(f"val/ssim_{tag}", ssim)
+
+        # Construct comparison image.
+        comparison = hcat(
+            add_label(vcat(*batch["context"]["image"][0]), "Context"),
+            add_label(vcat(*rgb_gt), "Target (Ground Truth)"),
+            add_label(vcat(*rgb_softmax), "Target (Softmax)"),
+        )
+        self.logger.log_image(
+            "comparison",
+            [prep_image(add_border(comparison))],
+            step=self.global_step,
+            caption=batch["scene"],
+        )
+
+        # Render projections and construct projection image.
+        projections = hcat(*render_projections(
+                                gaussians_softmax,
+                                256,
+                                extra_label="(Softmax)",
+                            )[0])
+        self.logger.log_image(
+            "projection",
+            [prep_image(add_border(projections))],
+            step=self.global_step,
+        )
+
+        # Draw cameras.
+        cameras = hcat(*render_cameras(batch, 256))
+        self.logger.log_image(
+            "cameras", [prep_image(add_border(cameras))], step=self.global_step
+        )
+
+        if self.encoder_visualizer is not None:
+            for k, image in self.encoder_visualizer.visualize(
+                batch["context"], self.global_step
+            ).items():
+                self.logger.log_image(k, [prep_image(image)], step=self.global_step)
+
+        # Run video validation step.
+        self.render_video_interpolation(gaussians_softmax, batch)
+        self.render_video_wobble(batch)
+        if self.train_cfg.extended_visualization:
+            self.render_video_interpolation_exaggerated(gaussians_softmax, batch)
+
+    @rank_zero_only
+    def render_video_wobble(self, batch: BatchedExample) -> None:
+        # Two views are needed to get the wobble radius.
+        _, v, _, _ = batch["context"]["extrinsics"].shape
+        if v != 2:
+            return
+
+        def trajectory_fn(t):
+            origin_a = batch["context"]["extrinsics"][:, 0, :3, 3]
+            origin_b = batch["context"]["extrinsics"][:, 1, :3, 3]
+            delta = (origin_a - origin_b).norm(dim=-1)
+            extrinsics = generate_wobble(
+                batch["context"]["extrinsics"][:, 0],
+                delta * 0.25,
+                t,
+            )
+            intrinsics = repeat(
+                batch["context"]["intrinsics"][:, 0],
+                "b i j -> b v i j",
+                v=t.shape[0],
+            )
+            return extrinsics, intrinsics
+
+        return self.render_video_generic(batch, trajectory_fn, "wobble", num_frames=60)
+
+    @rank_zero_only
+    def render_video_interpolation(self, gaussians_prob: EncoderOutput, batch: BatchedExample, name="rgb") -> None:
+        _, v, _, _ = batch["context"]["extrinsics"].shape
+
+        def trajectory_fn(t):
+            extrinsics = interpolate_extrinsics(
+                batch["context"]["extrinsics"][0, 0],
+                (
+                    batch["context"]["extrinsics"][0, 1]
+                    if v == 2
+                    else batch["target"]["extrinsics"][0, 0]
+                ),
+                t,
+            )
+            intrinsics = interpolate_intrinsics(
+                batch["context"]["intrinsics"][0, 0],
+                (
+                    batch["context"]["intrinsics"][0, 1]
+                    if v == 2
+                    else batch["target"]["intrinsics"][0, 0]
+                ),
+                t,
+            )
+            return extrinsics[None], intrinsics[None]
+
+        return self.render_video_generic(gaussians_prob, batch, trajectory_fn, name)
+
+    @rank_zero_only
+    def render_video_interpolation_exaggerated(self, gaussians_prob: EncoderOutput, batch: BatchedExample) -> None:
+        # Two views are needed to get the wobble radius.
+        _, v, _, _ = batch["context"]["extrinsics"].shape
+        if v != 2:
+            return
+
+        def trajectory_fn(t):
+            origin_a = batch["context"]["extrinsics"][:, 0, :3, 3]
+            origin_b = batch["context"]["extrinsics"][:, 1, :3, 3]
+            delta = (origin_a - origin_b).norm(dim=-1)
+            tf = generate_wobble_transformation(
+                delta * 0.5,
+                t,
+                5,
+                scale_radius_with_t=False,
+            )
+            extrinsics = interpolate_extrinsics(
+                batch["context"]["extrinsics"][0, 0],
+                (
+                    batch["context"]["extrinsics"][0, 1]
+                    if v == 2
+                    else batch["target"]["extrinsics"][0, 0]
+                ),
+                t * 5 - 2,
+            )
+            intrinsics = interpolate_intrinsics(
+                batch["context"]["intrinsics"][0, 0],
+                (
+                    batch["context"]["intrinsics"][0, 1]
+                    if v == 2
+                    else batch["target"]["intrinsics"][0, 0]
+                ),
+                t * 5 - 2,
+            )
+            return extrinsics @ tf, intrinsics[None]
+
+        return self.render_video_generic(
+            gaussians_prob, 
+            batch,
+            trajectory_fn,
+            "interpolation_exagerrated",
+            num_frames=300,
+            smooth=False,
+            loop_reverse=False,
+        )
+
+    @rank_zero_only
+    def render_video_generic(
+        self, 
+        gaussians_prob: EncoderOutput, 
+        batch: BatchedExample,
+        trajectory_fn: TrajectoryFn,
+        name: str,
+        num_frames: int = 30,
+        smooth: bool = True,
+        loop_reverse: bool = True,
+    ) -> None:
+
+        t = torch.linspace(0, 1, num_frames, dtype=torch.float32, device=self.device)
+        if smooth:
+            t = (torch.cos(torch.pi * (t + 1)) + 1) / 2
+
+        extrinsics, intrinsics = trajectory_fn(t)
+
+        _, _, _, h, w = batch["context"]["image"].shape
+
+        # Color-map the result.
+        def depth_map(result):
+            result = result + 1e-6
+            near = result[result > 0][:16_000_000].quantile(0.01).log()
+            far = result.view(-1)[:16_000_000].quantile(0.99).log()
+            result = result.log()
+            result = 1 - (result - near) / (far - near)
+            return apply_color_map_to_image(result, "turbo")
+
+        # TODO: Interpolate near and far planes?
+        near = repeat(batch["context"]["near"][:, 0], "b -> b v", v=num_frames)
+        far = repeat(batch["context"]["far"][:, 0], "b -> b v", v=num_frames)
+        output_prob = self.decoder.forward(
+            gaussians_prob, extrinsics, intrinsics, near, far, (h, w), "depth"
+        )
+        images_prob = [
+            vcat(rgb, depth)
+            for rgb, depth in zip(output_prob.color[0], depth_map(output_prob.depth[0]))
+        ]
+        # output_det = self.decoder.forward(
+        #     gaussians_det, extrinsics, intrinsics, near, far, (h, w), "depth"
+        # )
+        # images_det = [
+        #     vcat(rgb, depth)
+        #     for rgb, depth in zip(output_det.color[0], depth_map(output_det.depth[0]))
+        # ]
+        images = [
+            add_border(
+                hcat(
+                    add_label(image_prob, "Softmax"),
+                    # add_label(image_det, "Deterministic"),
+                )
+            )
+            for image_prob, _ in zip(images_prob, images_prob)
+        ]
+
+        video = torch.stack(images)
+        video = (video.clip(min=0, max=1) * 255).type(torch.uint8).cpu().numpy()
+        if loop_reverse:
+            video = pack([video, video[::-1][1:-1]], "* c h w")[0]
+        visualizations = {
+            f"video/{name}": wandb.Video(video[None], fps=30, format="mp4")
+        }
+
+        # Since the PyTorch Lightning doesn't support video logging, log to wandb directly.
+        try:
+            wandb.log(visualizations)
+        except Exception:
+            assert isinstance(self.logger, LocalLogger)
+            for key, value in visualizations.items():
+                tensor = value._prepare_video(value.data)
+                clip = mpy.ImageSequenceClip(list(tensor), fps=value._fps)
+                dir = LOG_PATH / key
+                dir.mkdir(exist_ok=True, parents=True)
+                clip.write_videofile(
+                    str(dir / f"{self.global_step:0>6}.mp4"), logger=None
+                )
+
+    def configure_optimizers(self):
+        optimizer = optim.Adam([
+            {'params': self.losses.parameters(), 'lr': self.optimizer_cfg.lr}, 
+            {'params': self.decoder.parameters(), 'lr': self.optimizer_cfg.lr}
+        ] + self.encoder.configure_optimizers(self.optimizer_cfg))
+        if self.optimizer_cfg.cosine_lr:
+            warm_up = torch.optim.lr_scheduler.OneCycleLR(
+                            optimizer, self.optimizer_cfg.lr,
+                            self.trainer.max_steps + 10,
+                            pct_start=0.01,
+                            cycle_momentum=False,
+                            anneal_strategy='cos',
+                        )
+        else:
+            warm_up_steps = self.optimizer_cfg.warm_up_steps
+            warm_up = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                1 / warm_up_steps,
+                1,
+                total_iters=warm_up_steps,
+        )
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": warm_up,
+                "interval": "step",
+                "frequency": 1,
+            },
+        }

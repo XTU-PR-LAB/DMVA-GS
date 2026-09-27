@@ -1,0 +1,95 @@
+defaults:
+  - dataset: [re10k]
+  - dataset/view_sampler: [all, arbitrary, bounded, evaluation]
+  - model/encoder: costvolume
+  - model/decoder: splatting_cuda
+  - model/mvsnet: mvsnet
+  - loss: [mse, lpips, depth]
+
+wandb:
+  project: sag-3dgs
+  entity: "974481066"
+  name: develop
+  mode: offline
+  id: null
+
+mode: train
+
+
+data_loader:
+  # Avoid having to spin up new processes to print out visualizations.
+  train:
+    num_workers: 2
+    persistent_workers: true
+    batch_size: 4
+    seed: 1234
+  test:
+    num_workers: 4
+    persistent_workers: false
+    batch_size: 1
+    seed: 2345
+  val:
+    num_workers: 1
+    persistent_workers: true
+    batch_size: 1
+    seed: 3456
+
+optimizer:
+  lr: 2.e-4
+  max_steps: 300_001
+  warm_up_steps: 2000
+  cosine_lr: true
+  delta_means_lr: 2.e-4
+  quaternion_lr: 2.e-4
+  scale_lr: 2.e-4
+  opacity_lr: 2.e-4
+  shs_lr: [2.e-4, 2.e-4, 2.e-4, 2.e-4]
+
+checkpointing:
+  load: null
+  every_n_train_steps: 20000  # 5000
+  save_top_k: -1
+  pretrained_model: null
+  resume: true
+
+train:
+  depth_mode: null
+  extended_visualization: false
+  print_log_every_n_steps: 10
+  num_context_views: 3
+  num_target_views: 1
+
+test:
+  output_path: outputs/test
+  compute_scores: false
+  eval_time_skip_steps: 0
+  save_image: true
+  save_video: false
+  fine_tune: false
+  fine_tune_cfg:
+    fine_tune_steps: 2000
+    means_lr: 2.e-3
+    quaternion_lr: 2.e-3
+    scale_lr: 1.e-3
+    opacity_lr: 5.e-3
+    shs_d1_lr: 5.e-3
+    shs_d2_lr: 1.e-3
+    shs_d3_lr: 2.e-4
+    shs_d4_lr: 4.e-5
+    lambda_dssim: 0.2
+  use_network_gui: false
+  export_ply: false
+  dataset_verify_path: overwrite_with_path_to_dataset
+  num_context_views: 3 # for mvsplat original code
+  num_target_views: 4
+
+seed: 111123
+
+trainer:
+  max_steps: -1
+  val_check_interval: 1.0
+  gradient_clip_val: 0.5
+  num_sanity_val_steps: 2
+  num_nodes: 1
+
+output_dir: null
